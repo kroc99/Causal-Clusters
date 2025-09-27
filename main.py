@@ -11,6 +11,7 @@ from CC import (
     train_network, extract_activations, perform_clustering_optimized, 
     get_image_dataloader, get_tabular_dataloader,
     create_latent_cluster_dataset, causal_discovery_all_layers,
+    compute_statistical_transition_graph,
     visualize_causal_graph, visualize_clusters, visualize_learned_features,
     write_html_page, create_integrated_gcfn,
     main_flexible_clustering, main_test_clustering, main_integrated_gcfn
@@ -183,7 +184,13 @@ def main():
             except Exception as e:
                 print(f"Error visualizing learned features for layer {layer_name}: {e}")
         
-        # Run causal discovery on the clusters
+        # Run statistical transition graph and causal discovery on the clusters
+        try:
+            print("Building statistical transition graph...")
+            stat_graph = compute_statistical_transition_graph(cluster_df)
+            visualize_causal_graph(stat_graph, "Statistical Transition Graph (P(G_{L+1}|G_L))")
+        except Exception as e:
+            print(f"Error building statistical graph: {e}")
         try:
             causal_graphs = causal_discovery_all_layers(
                 cluster_df, 
