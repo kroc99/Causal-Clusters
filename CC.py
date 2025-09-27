@@ -18,15 +18,17 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA, FastICA
-from sklearn.metrics import silhouette_score
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
 
 # For causal discovery (if installed)
 try:
     from causallearn.search.ConstraintBased.PC import pc
     from causallearn.utils.GraphUtils import GraphUtils
+    from causallearn.utils.cit import chisq, gsq  # discrete CI tests
     CAUSAL_LEARN_AVAILABLE = True
 except ImportError:
     CAUSAL_LEARN_AVAILABLE = False
@@ -823,7 +825,28 @@ def perform_clustering_optimized(activations, max_clusters=10, pca_components=50
     Returns:
         Dictionary of clustering results or (clusters, centers) tuple
     """
-    # Helper function to determine optimal number of clusters
+    # Helper: compute clustering quality metrics
+    def _metrics_for_labels(data, labels):
+        try:
+            unique = np.unique(labels)
+            if len(unique) <= 1:
+                return (False, float('-inf'), float('-inf'), float('-inf'))
+            sil = silhouette_score(data, labels)
+        except Exception:
+            sil = float('-inf')
+        try:
+            ch = calinski_harabasz_score(data, labels)
+        except Exception:
+            ch = float('-inf')
+        try:
+            db = davies_bouldin_score(data, labels)
+            db_term = -db  # lower DB is better
+        except Exception:
+            db_term = float('-inf')
+        # The first boolean indicates validity
+        return (True, sil, ch, db_term)
+
+    # Helper function to determine optimal number of clusters and algorithm
     def get_optimal_clusters(data, min_k=2, max_k=10):
         # Use provided parameters or defaults
         max_k = max_clusters_override if max_clusters_override is not None else min(max_k, max_clusters)
@@ -836,41 +859,52 @@ def perform_clustering_optimized(activations, max_clusters=10, pca_components=50
         if force_clusters is not None:
             return force_clusters
         
-        # Try different cluster counts
-        best_k = min_k  # Default is min_clusters
-        best_score = -1
+        # Try different cluster counts and models
+        best_k = min_k
+        best_algo = 'kmeans'
+        best_tuple = (False, float('-inf'), float('-inf'), float('-inf'))
         
-        # Cache for silhouette scores to avoid recomputation
-        silhouette_cache = {}
+        # Cache for metrics to avoid recomputation
+        metric_cache = {}
         
         for k in range(min_k, max_k + 1):
             try:
-                # Check cache first
-                cache_key = f"{data.shape}_{k}"
-                if cache_key in silhouette_cache:
-                    score = silhouette_cache[cache_key]
+                # KMeans metrics
+                cache_key_km = (data.shape, 'kmeans', k)
+                if cache_key_km in metric_cache:
+                    km_tuple = metric_cache[cache_key_km]
                 else:
-                    # Attempt clustering with k clusters
                     kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-                    labels = kmeans.fit_predict(data)
-                    
-                    # Calculate silhouette score (avoid if only one cluster)
-                    if len(np.unique(labels)) > 1:
-                        score = silhouette_score(data, labels)
-                        silhouette_cache[cache_key] = score
-                    else:
-                        score = -1
-                        silhouette_cache[cache_key] = score
+                    km_labels = kmeans.fit_predict(data)
+                    km_tuple = _metrics_for_labels(data, km_labels)
+                    metric_cache[cache_key_km] = km_tuple
                 
-                if score > best_score:
-                    best_score = score
+                # GMM metrics
+                cache_key_gmm = (data.shape, 'gmm', k)
+                if cache_key_gmm in metric_cache:
+                    gmm_tuple = metric_cache[cache_key_gmm]
+                else:
+                    gmm = GaussianMixture(n_components=k, covariance_type='full', random_state=42)
+                    gmm_labels = gmm.fit_predict(data)
+                    gmm_tuple = _metrics_for_labels(data, gmm_labels)
+                    metric_cache[cache_key_gmm] = gmm_tuple
+
+                # Choose best between KMeans and GMM using lexicographic comparison
+                # Prioritize valid silhouette, then silhouette value, then CH, then -DB
+                if km_tuple > best_tuple:
+                    best_tuple = km_tuple
                     best_k = k
+                    best_algo = 'kmeans'
+                if gmm_tuple > best_tuple:
+                    best_tuple = gmm_tuple
+                    best_k = k
+                    best_algo = 'gmm'
             except Exception as e:
                 print(f"Failed to cluster with k={k}: {e}")
                 continue
         
-        print(f"Optimal clusters: {best_k} (score: {best_score:.3f})")
-        return best_k
+        print(f"Optimal clusters: {best_k} using {best_algo} (sil={best_tuple[1]:.3f}, CH={best_tuple[2]:.2f}, -DB={best_tuple[3]:.3f})")
+        return best_k, best_algo
     
     # If activations is a single array (not a dictionary)
     if not isinstance(activations, dict):
@@ -882,14 +916,24 @@ def perform_clustering_optimized(activations, max_clusters=10, pca_components=50
         else:
             reduced = normalized
 
-        # Find optimal number of clusters
-        n_clusters = get_optimal_clusters(reduced, max_clusters)
+        # Find optimal number of clusters and model
+        n_clusters, algo = get_optimal_clusters(reduced, max_clusters)
         
-        # Perform clustering with optimal number
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-        clusters = kmeans.fit_predict(reduced)
-        print(f"Clustering complete with {n_clusters} clusters")
-        return clusters, kmeans.cluster_centers_
+        # Perform clustering with optimal number using best algorithm
+        if algo == 'gmm':
+            model = GaussianMixture(n_components=n_clusters, covariance_type='full', random_state=42)
+            clusters = model.fit_predict(reduced)
+        else:
+            model = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            clusters = model.fit_predict(reduced)
+        print(f"Clustering complete with {n_clusters} clusters using {algo}")
+        # Return clusters and pseudo-centers for compatibility
+        centers = None
+        if hasattr(model, 'cluster_centers_'):
+            centers = model.cluster_centers_
+        elif hasattr(model, 'means_'):
+            centers = model.means_
+        return clusters, centers
     
     # If activations is a dictionary
     clustering_results = {}
@@ -905,12 +949,16 @@ def perform_clustering_optimized(activations, max_clusters=10, pca_components=50
 
         # Find optimal number of clusters for this layer
         print(f"\nFinding optimal clusters for layer: {layer}")
-        n_clusters = get_optimal_clusters(reduced, max_clusters)
+        n_clusters, algo = get_optimal_clusters(reduced, max_clusters)
         
-        # Perform clustering with optimal number
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-        clustering_results[layer] = kmeans.fit_predict(reduced)
-        print(f"{layer}: clustering complete with {n_clusters} clusters")
+        # Perform clustering with optimal number using best algorithm
+        if algo == 'gmm':
+            model = GaussianMixture(n_components=n_clusters, covariance_type='full', random_state=42)
+            clustering_results[layer] = model.fit_predict(reduced)
+        else:
+            model = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            clustering_results[layer] = model.fit_predict(reduced)
+        print(f"{layer}: clustering complete with {n_clusters} clusters using {algo}")
         
     return clustering_results
 
@@ -943,6 +991,7 @@ def create_latent_cluster_dataset(clustering_results, labels):
     
     # Combine all one-hot encoded columns
     latent_df = pd.concat(df_list, axis=1)
+    latent_df = latent_df.fillna(0).astype(int)
     
     # Add labels if provided
     if labels is not None:
@@ -957,6 +1006,52 @@ def create_latent_cluster_dataset(clustering_results, labels):
         print(f"- {col}")
     
     return latent_df
+
+
+def compute_statistical_transition_graph(latent_df):
+    """
+    Build a directed graph with edge weights as empirical transition probabilities
+    between layer-wise clusters P(G_{L+1,j} | G_{L,i}).
+    """
+    df = latent_df.copy()
+    if 'label' in df.columns:
+        df = df.drop(columns=['label'])
+    # Identify layers and their columns
+    layer_to_cols = {}
+    for col in df.columns:
+        if '_cluster_' in col:
+            layer = col.split('_cluster_')[0]
+            layer_to_cols.setdefault(layer, []).append(col)
+    ordered_layers = sorted(layer_to_cols.keys())
+    G = nx.DiGraph()
+    # Ensure all node names exist
+    for cols in layer_to_cols.values():
+        for c in cols:
+            G.add_node(c)
+    # For each adjacent layer pair compute transitions
+    for i in range(len(ordered_layers) - 1):
+        L = ordered_layers[i]
+        L1 = ordered_layers[i + 1]
+        cols_L = layer_to_cols[L]
+        cols_L1 = layer_to_cols[L1]
+        X = df[cols_L].values.astype(int)
+        Y = df[cols_L1].values.astype(int)
+        # One-hot sanity: clamp to {0,1}
+        X = (X > 0).astype(int)
+        Y = (Y > 0).astype(int)
+        # For each cluster i in L, compute P(Y_j | X_i)
+        for idx_i, col_i in enumerate(cols_L):
+            xi = X[:, idx_i]
+            denom = xi.sum()
+            if denom == 0:
+                continue
+            for idx_j, col_j in enumerate(cols_L1):
+                yj = Y[:, idx_j]
+                num = np.logical_and(xi == 1, yj == 1).sum()
+                p = num / float(denom)
+                if p > 0:
+                    G.add_edge(col_i, col_j, weight=p)
+    return G
 
 
 def visualize_causal_graph(causal_graph, title="Causal Graph"):
@@ -1152,6 +1247,7 @@ def causal_discovery_all_layers(latent_df, method='pc'):
     df = latent_df.copy()
     
     # Remove label column if present
+    all_columns = df.columns.tolist()
     if "label" in df.columns:
         df = df.drop("label", axis=1)
     
@@ -1207,29 +1303,36 @@ def causal_discovery_all_layers(latent_df, method='pc'):
     
     print(f"Column mapping for causal discovery: {column_mapping}")
     
-    # Convert filtered_df to numpy array for causallearn
-    data = filtered_df.values
+    # Convert to numpy array with discrete values (0/1) for CI tests on binary features
+    data = filtered_df.values.astype(int)
     
     try:
         if method == 'pc':
             # Use PC algorithm with optimized parameter selection
             print("Using PC algorithm for causal discovery...")
             
-            # Try different alpha values systematically, starting with most promising
-            alpha_values = [0.1, 0.2, 0.3, 0.4, 0.5]
+            # Try different alpha values systematically
+            alpha_values = [0.01, 0.05, 0.1, 0.2, 0.3]
             best_cg = None
             best_edges = []
-            best_alpha = 0.2
+            best_alpha = 0.05
             
             for alpha in alpha_values:
                 try:
-                    cg = pc(data, alpha=alpha, verbose=False)
+                    # Prefer discrete CI test (G^2 / Chi-square) for one-hot binary columns
+                    indep_test = None
+                    if CAUSAL_LEARN_AVAILABLE:
+                        try:
+                            indep_test = gsq
+                        except Exception:
+                            indep_test = None
+                    cg = pc(data, alpha=alpha, indep_test=indep_test, verbose=False)
                     edges = cg.G.get_graph_edges()
                     print(f"DEBUG: PC algorithm with alpha={alpha} found {len(edges)} edges")
                     
                     # Prefer results with moderate number of edges (not too sparse, not too dense)
                     if len(edges) > 0:
-                        if best_cg is None or (len(edges) >= 2 and len(edges) <= len(data[0]) * 2):
+                        if best_cg is None or (len(edges) >= 2 and len(edges) <= data.shape[1] * 2):
                             best_cg = cg
                             best_edges = edges
                             best_alpha = alpha
@@ -1242,13 +1345,13 @@ def causal_discovery_all_layers(latent_df, method='pc'):
             if not best_edges:
                 print("Trying PC algorithm with stable parameters...")
                 try:
-                    cg = pc(data, alpha=0.3, stable=True, uc_rule=1, uc_priority=1, verbose=False)
+                    cg = pc(data, alpha=0.1, indep_test=indep_test, stable=True, uc_rule=1, uc_priority=1, verbose=False)
                     edges = cg.G.get_graph_edges()
                     print(f"DEBUG: PC algorithm with stable parameters found {len(edges)} edges")
                     if len(edges) > 0:
                         best_cg = cg
                         best_edges = edges
-                        best_alpha = 0.3
+                        best_alpha = 0.1
                 except Exception as e:
                     print(f"PC algorithm with stable parameters failed: {e}")
             
@@ -1264,11 +1367,23 @@ def causal_discovery_all_layers(latent_df, method='pc'):
             # Rename nodes back to original names
             causal_graph = nx.DiGraph()
             for edge in edges:
-                # Map back from "X1" notation to actual layer names
-                if hasattr(edge, 'node1') and hasattr(edge, 'node2'):
-                    source = column_mapping.get(str(edge.node1), str(edge.node1))
-                    target = column_mapping.get(str(edge.node2), str(edge.node2))
-                    causal_graph.add_edge(source, target)
+                # Map back from pc node ids (integers) to column names
+                try:
+                    if hasattr(edge, 'node1') and hasattr(edge, 'node2'):
+                        # causallearn edge
+                        src_idx = int(str(edge.node1).replace('X', '')) - 1 if str(edge.node1).startswith('X') else int(str(edge.node1))
+                        tgt_idx = int(str(edge.node2).replace('X', '')) - 1 if str(edge.node2).startswith('X') else int(str(edge.node2))
+                        if 0 <= src_idx < len(remaining_columns) and 0 <= tgt_idx < len(remaining_columns):
+                            source = remaining_columns[src_idx]
+                            target = remaining_columns[tgt_idx]
+                            causal_graph.add_edge(source, target)
+                    else:
+                        # networkx-like tuple
+                        source = column_mapping.get(str(edge[0]), str(edge[0]))
+                        target = column_mapping.get(str(edge[1]), str(edge[1]))
+                        causal_graph.add_edge(source, target)
+                except Exception as e:
+                    print(f"DEBUG: Failed mapping edge {edge}: {e}")
             
             # If still no meaningful edges, fall back to hierarchical structure
             if not causal_graph.edges():
@@ -1336,23 +1451,28 @@ def create_hierarchical_causal_graph(all_columns):
     layer_order = sorted(layer_clusters.keys())
     print(f"Layer order for hierarchical graph: {layer_order}")
     
-    # Connect clusters between adjacent layers
+    # Connect clusters between adjacent layers with sparse forward-only edges
     for i in range(len(layer_order) - 1):
         current_layer = layer_order[i]
         next_layer = layer_order[i + 1]
         
-        # Try to create meaningful connections based on cluster indices
-        for current_cluster in layer_clusters[current_layer]:
-            # Connect to clusters in next layer
-            # Strategy: Connect to 1-2 clusters in the next layer to avoid a fully connected graph
-            for next_cluster in layer_clusters[next_layer]:
-                # Simple heuristic: connect clusters with same index or adjacent indices
-                if (current_cluster == next_cluster or
-                    int(current_cluster) == int(next_cluster) + 1 or
-                    int(current_cluster) == int(next_cluster) - 1):
-                    source = f"{current_layer}_cluster_{current_cluster}"
-                    target = f"{next_layer}_cluster_{next_cluster}"
-                    hierarchical_graph.add_edge(source, target)
+        current_indices = sorted(list(layer_clusters[current_layer]), key=lambda x: int(x) if str(x).isdigit() else 0)
+        next_indices = sorted(list(layer_clusters[next_layer]), key=lambda x: int(x) if str(x).isdigit() else 0)
+        
+        for idx, current_cluster in enumerate(current_indices):
+            # Connect to same-index and nearest neighbors in next layer when available
+            preferred = []
+            if idx < len(next_indices):
+                preferred.append(next_indices[idx])
+            if idx - 1 >= 0:
+                preferred.append(next_indices[max(0, idx - 1)])
+            if idx + 1 < len(next_indices):
+                preferred.append(next_indices[min(len(next_indices) - 1, idx + 1)])
+            
+            for next_cluster in set(preferred):
+                source = f"{current_layer}_cluster_{current_cluster}"
+                target = f"{next_layer}_cluster_{next_cluster}"
+                hierarchical_graph.add_edge(source, target)
     
     print(f"Created hierarchical graph with {len(hierarchical_graph.edges())} edges")
     return hierarchical_graph
@@ -1379,9 +1499,10 @@ def visualize_clusters(activations, clustering_results, layer_name, apply_pca=Tr
         data = pca.fit_transform(data)
     
     # Use t-SNE for visualization
-    # Set perplexity based on data size (avoid perplexity > n_samples / 3)
-    perplexity = min(tsne_perplexity, data.shape[0] // 3)
-    tsne = TSNE(n_components=2, perplexity=perplexity, n_iter=tsne_n_iter, random_state=42)
+    # Bound perplexity to valid range: (5 .. n_samples/3]
+    max_perp = max(5, data.shape[0] // 3)
+    perplexity = max(5, min(tsne_perplexity, max_perp))
+    tsne = TSNE(n_components=2, perplexity=perplexity, n_iter=tsne_n_iter, random_state=42, init='pca', learning_rate='auto')
     emb_2d = tsne.fit_transform(data)
     
     # Get cluster assignments and count

@@ -14,6 +14,7 @@ from CC import (
     get_image_dataloader, SimpleCNN, extract_activations,
     perform_clustering_optimized, create_latent_cluster_dataset,
     causal_discovery_all_layers, visualize_causal_graph,
+    compute_statistical_transition_graph,
     write_html_page
 )
 
@@ -72,7 +73,10 @@ def test_pipeline():
         print(f"Latent dataset shape: {latent_df.shape}")
         print("Columns:", list(latent_df.columns))
         
-        # Step 6: Causal discovery
+        # Step 6: Statistical transitions and causal discovery
+        print("Computing statistical transition graph...")
+        stat_graph = compute_statistical_transition_graph(latent_df)
+        visualize_causal_graph(stat_graph, "Statistical Transition Graph (Pipeline Test)")
         print("Performing causal discovery...")
         causal_graph = causal_discovery_all_layers(latent_df)
         if causal_graph is not None:
